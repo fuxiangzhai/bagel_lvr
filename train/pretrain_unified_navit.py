@@ -355,6 +355,10 @@ class TrainingArguments:
         default=1.0,
         metadata={"help": "Scaling factor for the LVR alignment loss."}
     )
+    lvr_latent_end_weight: float = field(
+        default=1.0,
+        metadata={"help": "Scaling factor for the LVR latent end (exit strategy) loss."}
+    )
     anchor_weight: float = field(
         default=1.0,
         metadata={"help": "Scaling factor for the CoVT anchor loss."}
@@ -607,6 +611,9 @@ def main():
         model.vit_model.eval()
         for param in model.vit_model.parameters():
             param.requires_grad = False
+        # Stage-1训练不需要anchor投影层，一并冻结以节省显存
+        for param in model.anchor_projections.parameters():
+            param.requires_grad = False
 
     # Setup FSDP and load pretrained model:
     fsdp_config = FSDPConfig(
@@ -669,6 +676,21 @@ def main():
     # Setup packed dataloader
     with open(data_args.dataset_config_file, "r") as stream:
         dataset_meta = yaml.safe_load(stream)
+    
+    # Override use_latent_end_token in YAML with command line argument
+    # This allows controlling the LVR exit strategy via environment variables
+    # Command line arguments have higher priority than YAML config
+    for group_name, group_config in dataset_meta.items():
+        if isinstance(group_config, dict):
+            if 'use_latent_end_token' in group_config:
+                # Override if exists in YAML
+                group_config['use_latent_end_token'] = model_args.lvr_latent_end_token
+                logger.info(f"Override {group_name}.use_latent_end_token = {model_args.lvr_latent_end_token}")
+            elif model_args.lvr_latent_end_token:
+                # Add if not exists in YAML but command line is True
+                group_config['use_latent_end_token'] = model_args.lvr_latent_end_token
+                logger.info(f"Add {group_name}.use_latent_end_token = {model_args.lvr_latent_end_token}")
+    
     dataset_config = DataConfig(grouped_datasets=dataset_meta)
     if training_args.visual_und:
         dataset_config.vit_patch_size = model_args.vit_patch_size
@@ -716,38 +738,45 @@ def main():
     # train loop
     start_time = time()
     logger.info(f"Training for {training_args.total_steps} steps, starting at {train_step}...")
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)  # 优化：set_to_none=True释放显存而不是填0
     total_norm = torch.tensor(0.0, device=device)
     token_window = 0.0
     seqlen_square_window = 0.0
+    # 本地累积统计信息，延迟同步到logging时
+    local_token_count = 0.0
+    local_seqlen_square = 0.0
     dense_token_factor, attn_factor = qwen2_flop_coefficients(model.language_model.config)
     for micro_step, data in enumerate(train_loader):
         curr_step = train_step + micro_step // training_args.gradient_accumulation_steps
         if curr_step >= training_args.total_steps:
             logger.info(f"Reached total_steps={training_args.total_steps}, stopping training.")
             break
+        # 将数据移到GPU
         data = data.cuda(device).to_dict()
         data_indexes = data.pop('batch_data_indexes', None)
         ce_loss_weights = data.pop('ce_loss_weights', None)       
-        tokens_tensor = torch.tensor(float(data['sequence_length']), device=device)
-        dist.all_reduce(tokens_tensor, op=dist.ReduceOp.SUM)
-        token_window += tokens_tensor.item()
+        # 优化：先本地累积，延迟all_reduce到logging时
+        local_token_count += float(data['sequence_length'])
         if data['sample_lens']:
             sample_lens_tensor = torch.tensor(data['sample_lens'], dtype=torch.float32, device=device)
             sample_square = torch.dot(sample_lens_tensor, sample_lens_tensor)
-            dist.all_reduce(sample_square, op=dist.ReduceOp.SUM)
-            seqlen_square_window += sample_square.item()
+            local_seqlen_square += sample_square.item()
+            del sample_lens_tensor, sample_square  # 及时释放不需要的tensor
 
         with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
             if training_args.visual_gen:
                 with torch.no_grad():
-                    data['padded_latent'] = vae_model.encode(data.pop('padded_images'))
+                    # 优化：立即pop padded_images并编码，减少显存峰值
+                    padded_images = data.pop('padded_images')
+                    data['padded_latent'] = vae_model.encode(padded_images)
+                    del padded_images  # 及时释放原始图像tensor
             try:
                 loss_dict = fsdp_model(**data)
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     logger.error(f"CUDA OOM at step {curr_step}: {e}")
                     torch.cuda.empty_cache()
+                    gc.collect()  # 添加垃圾回收
                 raise e
         
         loss = 0
@@ -760,10 +789,12 @@ def main():
                 total_ce_loss_weights = ce_loss_weights.sum()
                 dist.all_reduce(total_ce_loss_weights, op=dist.ReduceOp.SUM)
                 ce = ce.sum() * dist.get_world_size() / total_ce_loss_weights
+                del total_ce_loss_weights  # 优化：及时释放中间变量
             else:
                 ce = ce.sum() * dist.get_world_size() / total_ce_tokens
             loss_dict["ce"] = ce.detach()
             loss = loss + ce * training_args.ce_weight
+            del ce  # 优化：及时释放，避免保留计算图
         else:
             assert not training_args.visual_und
             loss_dict["ce"] = torch.tensor(0, device=device)
@@ -775,8 +806,19 @@ def main():
                 lvr = lvr.mean()
             loss_dict["lvr"] = lvr.detach()
             loss = loss + lvr * training_args.lvr_weight
+            del lvr  # 优化：及时释放
         else:
             loss_dict["lvr"] = torch.tensor(0, device=device)
+
+        lvr_latent_end = loss_dict.get("lvr_latent_end")
+        if lvr_latent_end is not None:
+            if lvr_latent_end.ndim > 0:
+                lvr_latent_end = lvr_latent_end.mean()
+            loss_dict["lvr_latent_end"] = lvr_latent_end.detach()
+            loss = loss + lvr_latent_end * training_args.lvr_latent_end_weight
+            del lvr_latent_end  # 优化：及时释放
+        else:
+            loss_dict["lvr_latent_end"] = torch.tensor(0, device=device)
 
         if training_args.visual_gen:
             mse = loss_dict["mse"]
@@ -785,6 +827,7 @@ def main():
             mse = mse.mean(dim=-1).sum() * dist.get_world_size() / total_mse_tokens
             loss_dict["mse"] = mse.detach()
             loss = loss + mse * training_args.mse_weight
+            del mse  # 优化：及时释放
         else:
             assert not training_args.visual_gen
             loss_dict["mse"] = torch.tensor(0, device=device)
@@ -796,21 +839,39 @@ def main():
                 anchor = anchor.mean()
             loss_dict["anchor"] = anchor.detach()
             loss = loss + anchor * training_args.anchor_weight
+            del anchor  # 优化：及时释放
         else:
             loss_dict["anchor"] = torch.tensor(0, device=device)
 
         loss = loss / training_args.gradient_accumulation_steps
         loss.backward()
+        del loss  # 优化：backward后立即释放loss tensor
 
         if (micro_step + 1) % training_args.gradient_accumulation_steps == 0:
             total_norm = fsdp_model.clip_grad_norm_(training_args.max_grad_norm)
             optimizer.step()
             scheduler.step()
             fsdp_ema_update(ema_model, fsdp_model, decay=training_args.ema)
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)  # 优化：set_to_none=True释放显存而不是填0
+            # 优化：每个完整的gradient accumulation cycle后清理显存碎片
+            if curr_step % 5 == 0:  # 每5个optimizer step清理一次，避免过于频繁
+                torch.cuda.empty_cache()
         
         # Log loss values:
         if curr_step % training_args.log_every == 0:
+            # 优化：在logging时才进行all_reduce同步统计信息（而不是每个micro step）
+            tokens_tensor = torch.tensor(local_token_count, device=device)
+            dist.all_reduce(tokens_tensor, op=dist.ReduceOp.SUM)
+            token_window = tokens_tensor.item()
+            
+            seqlen_square_tensor = torch.tensor(local_seqlen_square, device=device)
+            dist.all_reduce(seqlen_square_tensor, op=dist.ReduceOp.SUM)
+            seqlen_square_window = seqlen_square_tensor.item()
+            
+            # 重置本地累积
+            local_token_count = 0.0
+            local_seqlen_square = 0.0
+            
             total_samples = torch.tensor(len(data['sample_lens']), device=device)
             dist.all_reduce(total_samples, op=dist.ReduceOp.SUM)
 
@@ -861,6 +922,10 @@ def main():
             start_time = time()
             token_window = 0.0
             seqlen_square_window = 0.0
+            
+            # 优化：在logging后清理显存碎片（定期进行，不要太频繁）
+            if curr_step % (training_args.log_every * 10) == 0:
+                torch.cuda.empty_cache()
 
         if data_status is None:
             data_status = {}
@@ -868,6 +933,9 @@ def main():
             if item['dataset_name'] not in data_status.keys():
                 data_status[item['dataset_name']] = {}
             data_status[item['dataset_name']][item['worker_id']] = item['data_indexes']
+        
+        # 优化：及时释放data字典，避免显存累积
+        del data, data_indexes, ce_loss_weights
 
         if curr_step > 0 and curr_step % training_args.save_every == 0:
             # Clear caches and ensure all CUDA operations complete before checkpoint

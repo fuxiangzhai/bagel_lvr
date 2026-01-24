@@ -10,7 +10,65 @@ import torch
 from torch.nn.attention.flex_attention import or_masks, and_masks
 
 
-def create_sparse_mask(document_lens, split_lens, attn_modes, device):
+def create_sparse_mask(document_lens, split_lens, attn_modes, device, block_size=128):
+    """
+    Create sparse attention mask for FlexAttention.
+    
+    IMPORTANT: FlexAttention's create_block_mask rounds up sequence length to 
+    multiples of BLOCK_SIZE. The mask functions may receive indices beyond the 
+    actual sequence length. We must handle this by:
+    1. Padding tensors to aligned length, OR
+    2. Using safe indexing with boundary checks
+    
+    We use approach 1 (padding) for better performance as it avoids conditional
+    branching in the mask functions.
+    """
+    # 验证长度一致性
+    split_lens_sum = sum(split_lens)
+    document_lens_sum = sum(document_lens)
+    if split_lens_sum != document_lens_sum:
+        raise ValueError(
+            f"Length mismatch in create_sparse_mask: sum(split_lens)={split_lens_sum} != sum(document_lens)={document_lens_sum}\n"
+            f"split_lens={split_lens}\n"
+            f"document_lens={document_lens}\n"
+            f"attn_modes={attn_modes}"
+        )
+    
+    seqlen = split_lens_sum
+    # Calculate aligned length (rounded up to block_size)
+    aligned_len = ((seqlen + block_size - 1) // block_size) * block_size
+    pad_len = aligned_len - seqlen
+    
+    full_and_noise_tmp = []
+    noise_tmp = []
+
+    for i, (length, model) in enumerate(zip(split_lens, attn_modes)):
+        value = i if model in ['full', 'noise'] else -1
+        full_and_noise_tmp.extend([value] * length)
+        value_noise = i if model == 'noise' else -1
+        noise_tmp.extend([value_noise] * length)
+
+    # Pad with -1 (invalid document) to handle out-of-bounds access from FlexAttention
+    # When q_idx or kv_idx >= seqlen, they will access padded region with -1
+    # This ensures:
+    # - full_and_noise_mask returns False (since -1 < 0)
+    # - remove_noise_mask returns True (since -1 indicates not a noise region)
+    # - sample_mask returns False (since padded region has document_id=0, different from valid docs starting at 1)
+    if pad_len > 0:
+        full_and_noise_tmp.extend([-1] * pad_len)
+        noise_tmp.extend([-1] * pad_len)
+
+    full_and_noise_seq_id = torch.tensor(full_and_noise_tmp, dtype=torch.int64, device=device)
+    noise_seq_id = torch.tensor(noise_tmp, dtype=torch.int64, device=device)
+
+    # document_id uses 1-indexed document IDs, pad with 0 (invalid document)
+    document_id_list = []
+    for i, l in enumerate(document_lens, start=1):
+        document_id_list.extend([i] * l)
+    if pad_len > 0:
+        document_id_list.extend([0] * pad_len)  # 0 means invalid/padding
+    document_id = torch.tensor(document_id_list, dtype=torch.int64, device=device)
+
     def causal_mask(b, h, q_idx, kv_idx):
         return q_idx >= kv_idx
 
@@ -22,20 +80,6 @@ def create_sparse_mask(document_lens, split_lens, attn_modes, device):
 
     def sample_mask(b, h, q_idx, kv_idx):
         return document_id[q_idx] == document_id[kv_idx]
-
-    full_and_noise_tmp = []
-    noise_tmp = []
-
-    for i, (length, model) in enumerate(zip(split_lens, attn_modes)):
-        value = i if model in ['full', 'noise'] else -1
-        full_and_noise_tmp.extend([value] * length)
-        value_noise = i if model == 'noise' else -1
-        noise_tmp.extend([value_noise] * length)
-
-    full_and_noise_seq_id = torch.Tensor(full_and_noise_tmp).to(device)
-    noise_seq_id = torch.Tensor(noise_tmp).to(device)
-
-    document_id = torch.cat([torch.full((l,), i) for i, l in enumerate(document_lens, start=1)]).to(device)
 
     return and_masks(or_masks(causal_mask, full_and_noise_mask), remove_noise_mask, sample_mask)
 

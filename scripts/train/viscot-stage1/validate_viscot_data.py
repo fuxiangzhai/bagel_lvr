@@ -150,7 +150,7 @@ def main():
     if "error" in parquet_result:
         print(f"  ERROR: {parquet_result['error']}")
         print("\n  Please run data preparation first:")
-        print("    bash scripts/prepare_viscot_stage1_v2.sh")
+        print("    bash scripts/train/viscot-stage1/prepare_viscot_stage1.sh")
         sys.exit(1)
     
     print(f"  Parquet files: {parquet_result['num_files']}")
@@ -212,7 +212,7 @@ def main():
         print("  Data is ready for training!")
         print("\n  Next steps:")
         print("    1. Fix any configuration issues above (if any)")
-        print("    2. Run training: bash scripts/train_stage1_lvr_viscot.sh")
+        print("    2. Run training: bash scripts/train/viscot-stage1/train_stage1_lvr_viscot.sh")
     else:
         print("\n  Please fix the issues above before training.")
         sys.exit(1)

@@ -182,25 +182,60 @@ class PackedDataset(torch.utils.data.IterableDataset):
             packed_vit_position_ids     = list(),
             packed_vit_token_indexes    = list(), 
             lvr_target_vit_indexes      = list(),
+            # LVR mode switch training: track lvr_start positions and lvr token positions
+            lvr_start_positions         = list(),  # positions of <|lvr_start|> tokens
+            lvr_token_positions         = list(),  # positions of <|lvr|> tokens  
+            lvr_end_positions           = list(),  # positions of <|lvr_end|> tokens
+            lvr_latent_end_positions    = list(),  # positions for latent end prediction target
         )
         return sequence_status
 
     def to_tensor(self, sequence_status):
+        actual_sequence_length = sum(sequence_status['sample_lens'])
+        
         data = dict(
-            sequence_length=sum(sequence_status['sample_lens']),
-            sample_lens=sequence_status['sample_lens'],
+            sequence_length=actual_sequence_length,
+            sample_lens=sequence_status['sample_lens'].copy(),  # 使用副本，避免修改原列表
             packed_text_ids=torch.tensor(sequence_status['packed_text_ids']),
             packed_text_indexes=torch.tensor(sequence_status['packed_text_indexes']),
             packed_position_ids=torch.tensor(sequence_status['packed_position_ids']),
         )
+        
         if not self.use_flex:
             data['nested_attention_masks'] = sequence_status['nested_attention_masks']
         else:
-            sequence_len = data['sequence_length']
-            pad_len = self.max_num_tokens - sequence_len
-            data['split_lens'] = sequence_status['split_lens'] + [pad_len]
-            data['attn_modes'] = sequence_status['attn_modes'] + ['causal']
-            data['sample_lens'] += [pad_len]
+            pad_len = self.max_num_tokens - actual_sequence_length
+            
+            # 验证split_lens和sample_lens的sum必须严格相等
+            split_lens_sum = sum(sequence_status['split_lens'])
+            sample_lens_sum = sum(sequence_status['sample_lens'])
+            
+            if split_lens_sum != sample_lens_sum:
+                raise ValueError(
+                    f"CRITICAL BUG: sum(split_lens)={split_lens_sum} != sum(sample_lens)={sample_lens_sum}\n"
+                    f"split_lens={sequence_status['split_lens']}\n"
+                    f"sample_lens={sequence_status['sample_lens']}\n"
+                    f"attn_modes={sequence_status['attn_modes']}"
+                )
+            
+            # 添加padding以对齐到max_num_tokens
+            if pad_len > 0:
+                data['split_lens'] = sequence_status['split_lens'] + [pad_len]
+                data['attn_modes'] = sequence_status['attn_modes'] + ['causal']
+                data['sample_lens'] = data['sample_lens'] + [pad_len]
+                data['sequence_length'] = actual_sequence_length + pad_len
+                
+                # CRITICAL: 也需要 padding packed_position_ids，否则会导致 rotary embedding 维度不匹配
+                # padding 部分使用 0 作为 position id（不会影响实际计算，因为 padding 部分不会被使用）
+                last_position_id = sequence_status['packed_position_ids'][-1] if sequence_status['packed_position_ids'] else 0
+                padding_position_ids = list(range(last_position_id + 1, last_position_id + 1 + pad_len))
+                data['packed_position_ids'] = torch.tensor(sequence_status['packed_position_ids'] + padding_position_ids)
+            else:
+                # 实际长度已超过限制，不需要padding（理论上不应该走到这里）
+                data['split_lens'] = sequence_status['split_lens']
+                data['attn_modes'] = sequence_status['attn_modes']
+                if pad_len < 0:
+                    print(f"Warning: sequence length ({actual_sequence_length}) exceeds max_num_tokens ({self.max_num_tokens}) by {-pad_len} tokens")
 
         # if the model has a convnet vae (e.g., as visual tokenizer)
         if len(sequence_status['vae_image_tensors']) > 0:
@@ -224,6 +259,16 @@ class PackedDataset(torch.utils.data.IterableDataset):
             data['vit_token_seqlens'] = torch.tensor(sequence_status['vit_token_seqlens'])
             if sequence_status['lvr_target_vit_indexes']:
                 data['lvr_target_vit_indexes'] = torch.tensor(sequence_status['lvr_target_vit_indexes'])
+            
+            # LVR mode switch training data
+            if sequence_status['lvr_start_positions']:
+                data['lvr_start_positions'] = torch.tensor(sequence_status['lvr_start_positions'])
+            if sequence_status['lvr_token_positions']:
+                data['lvr_token_positions'] = torch.tensor(sequence_status['lvr_token_positions'])
+            if sequence_status['lvr_end_positions']:
+                data['lvr_end_positions'] = torch.tensor(sequence_status['lvr_end_positions'])
+            if sequence_status['lvr_latent_end_positions']:
+                data['lvr_latent_end_positions'] = torch.tensor(sequence_status['lvr_latent_end_positions'])
 
         # if the model is required to perform visual generation
         if len(sequence_status['packed_timesteps']) > 0:
@@ -236,7 +281,55 @@ class PackedDataset(torch.utils.data.IterableDataset):
             data['ce_loss_indexes'] = torch.tensor(sequence_status['ce_loss_indexes'])
             data['ce_loss_weights'] = torch.tensor(sequence_status['ce_loss_weights'])
 
+        # 最终验证：确保所有长度一致性（仅对flex attention）
+        if self.use_flex and 'split_lens' in data:
+            final_seqlen = sum(data['sample_lens'])
+            final_split_sum = sum(data['split_lens'])
+            final_sequence_length = data['sequence_length']
+            
+            if final_seqlen != final_split_sum:
+                raise ValueError(
+                    f"FINAL CHECK FAILED: sum(sample_lens)={final_seqlen} != sum(split_lens)={final_split_sum}\n"
+                    f"sample_lens={data['sample_lens']}\n"
+                    f"split_lens={data['split_lens']}"
+                )
+            
+            if final_sequence_length != final_seqlen:
+                raise ValueError(
+                    f"FINAL CHECK FAILED: sequence_length={final_sequence_length} != sum(sample_lens)={final_seqlen}\n"
+                    f"sample_lens={data['sample_lens']}\n"
+                    f"This will cause index out of bounds in FlexAttention!"
+                )
+
         return data
+
+    def estimate_sample_length(self, sample):
+        """
+        估算sample打包后的实际长度，包括特殊tokens
+        
+        Args:
+            sample: 包含'num_tokens'和'sequence_plan'的字典
+            
+        Returns:
+            估算的总token数量
+        """
+        estimated_extra_tokens = 0
+        for plan_item in sample.get('sequence_plan', []):
+            item_type = plan_item.get('type', '')
+            if item_type == 'vit_image':
+                # startofimage + endofimage
+                estimated_extra_tokens += 2
+            elif item_type == 'text':
+                # bos token
+                estimated_extra_tokens += 1
+            elif item_type == 'lvr_token':
+                # lvr_start + lvr_end + 可能的lvr_latent_end
+                estimated_extra_tokens += 3
+            elif item_type == 'vae_image':
+                # startofimage + endofimage
+                estimated_extra_tokens += 2
+        
+        return sample.get('num_tokens', 0) + estimated_extra_tokens
 
     def __iter__(self):
         total_weights = sum(self.grouped_weights)
@@ -250,19 +343,31 @@ class PackedDataset(torch.utils.data.IterableDataset):
         while True:
             # Ensure at least one sample from each group
             if sequence_status['curr'] == 0:
+                mandatory_overflow = False
                 for group_index, group_iter in enumerate(self.dataset_iters):
                     if self.is_mandatory[group_index]:
                         while True:
                             sample = next(group_iter)
                             # if a sample is too long, skip it
-                            num_tokens = sample['num_tokens'] + 2 * len(sample['sequence_plan'])
+                            num_tokens = self.estimate_sample_length(sample)
                             if num_tokens < self.max_num_tokens_per_sample:
                                 sequence_status = self.pack_sequence(sample, sequence_status)
                                 batch_data_indexes.append(sample['data_indexes'])
+                                # 检查实际长度是否超过限制
+                                if sequence_status['curr'] > self.max_num_tokens:
+                                    print(f"Warning: mandatory samples exceed max_num_tokens ({sequence_status['curr']} > {self.max_num_tokens}), restarting batch")
+                                    mandatory_overflow = True
                                 break
                             else:
                                 print(f"skip a sample with length {num_tokens}")
                                 continue
+                    if mandatory_overflow:
+                        break
+                # 如果 mandatory 样本导致超长，重新开始
+                if mandatory_overflow:
+                    sequence_status = self.set_sequence_status()
+                    batch_data_indexes = []
+                    continue
 
             if sequence_status['curr'] < self.prefer_buffer_before and len(buffer) > 0:
                 sample = buffer.pop(0)
@@ -279,7 +384,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 sample_from_buffer = False
 
             # if a sample is too long, skip it
-            num_tokens = sample['num_tokens'] + 2 * len(sample['sequence_plan'])
+            num_tokens = self.estimate_sample_length(sample)
             if num_tokens > self.max_num_tokens_per_sample:
                 print(f"skip a sample with length {num_tokens}")
                 continue
@@ -287,17 +392,34 @@ class PackedDataset(torch.utils.data.IterableDataset):
             if sequence_status['curr'] + num_tokens > self.max_num_tokens:
                 if len(buffer) < self.max_buffer_size and not sample_from_buffer:
                     buffer.append(sample)
+                    continue
                 else:
-                    print(f"Yielding data with length {sum(sequence_status['sample_lens'])}")
-                    data = self.to_tensor(sequence_status)
-                    data['batch_data_indexes'] = batch_data_indexes
-                    yield data
-                    sequence_status = self.set_sequence_status()
-                    batch_data_indexes = []
-                continue
+                    # 修复：yield当前batch后，将sample添加到新batch
+                    if sequence_status['curr'] > 0:
+                        print(f"Yielding data with length {sum(sequence_status['sample_lens'])}")
+                        data = self.to_tensor(sequence_status)
+                        data['batch_data_indexes'] = batch_data_indexes
+                        yield data
+                        sequence_status = self.set_sequence_status()
+                        batch_data_indexes = []
+                    
+                    # 关键修复：检查单样本是否本身就超过max_num_tokens
+                    # 如果是，跳过这个样本，避免索引越界
+                    if num_tokens > self.max_num_tokens:
+                        print(f"skip a sample with length {num_tokens} (exceeds max_num_tokens={self.max_num_tokens})")
+                        continue
 
             sequence_status = self.pack_sequence(sample, sequence_status)
             batch_data_indexes.append(sample['data_indexes'])
+            
+            # 关键检查：pack_sequence后的实际长度可能超过估算值
+            # 如果实际长度超过max_num_tokens，丢弃这个batch并重新开始
+            actual_len = sequence_status['curr']
+            if actual_len > self.max_num_tokens:
+                print(f"Warning: actual sequence length ({actual_len}) exceeds max_num_tokens ({self.max_num_tokens}), discarding batch and restarting")
+                sequence_status = self.set_sequence_status()
+                batch_data_indexes = []
+                continue
 
             if sequence_status['curr'] >= self.expected_num_tokens:
                 data = self.to_tensor(sequence_status)
@@ -326,12 +448,48 @@ class PackedDataset(torch.utils.data.IterableDataset):
 
             if item['type'] == 'lvr_token':
                 lvr_token_id = getattr(self, "lvr_token_id", None)
+                lvr_start_id = getattr(self, "lvr_start_id", None)
+                lvr_end_id = getattr(self, "lvr_end_id", None)
+                lvr_latent_end_id = getattr(self, "lvr_latent_end_id", None)
                 if lvr_token_id is None:
                     continue
-                sequence_status['packed_text_ids'].append(lvr_token_id)
-                sequence_status['packed_text_indexes'].append(curr)
-                curr += 1
-                curr_split_len += 1
+                
+                # 获取LVR token数量和配置
+                num_lvr_tokens = item.get('num_lvr_tokens', 1)
+                use_latent_end_token = item.get('use_latent_end_token', False)
+                
+                # Add <|lvr_start|> token first (this is where the model enters LVR mode)
+                if lvr_start_id is not None:
+                    sequence_status['packed_text_ids'].append(lvr_start_id)
+                    sequence_status['packed_text_indexes'].append(curr)
+                    sequence_status['lvr_start_positions'].append(curr)
+                    curr += 1
+                    curr_split_len += 1
+                
+                # Add N <|lvr|> tokens (the actual latent reasoning positions)
+                for _ in range(num_lvr_tokens):
+                    sequence_status['packed_text_ids'].append(lvr_token_id)
+                    sequence_status['packed_text_indexes'].append(curr)
+                    sequence_status['lvr_token_positions'].append(curr)
+                    curr += 1
+                    curr_split_len += 1
+                
+                # Add <|lvr_latent_end|> token (for learning when to exit LVR mode)
+                # 只在最后一个lvr token后添加
+                if use_latent_end_token and lvr_latent_end_id is not None:
+                    sequence_status['packed_text_ids'].append(lvr_latent_end_id)
+                    sequence_status['packed_text_indexes'].append(curr)
+                    sequence_status['lvr_latent_end_positions'].append(curr)
+                    curr += 1
+                    curr_split_len += 1
+                
+                # Add <|lvr_end|> token (this is where the model exits LVR mode)
+                if lvr_end_id is not None:
+                    sequence_status['packed_text_ids'].append(lvr_end_id)
+                    sequence_status['packed_text_indexes'].append(curr)
+                    sequence_status['lvr_end_positions'].append(curr)
+                    curr += 1
+                    curr_split_len += 1
 
                 attn_modes.append("causal")
                 sequence_status['packed_position_ids'].extend(range(curr_rope_id, curr_rope_id + curr_split_len))
@@ -476,6 +634,8 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 curr_split_len += 1
 
                 # update sequence status
+                # 注意：attn_modes只在split_start时添加，因为一个split可能包含多个items
+                # 必须确保每个有split_start的item最终都有对应的split_end
                 if split_start:
                     if item['loss'] == 1 and 'frame_delta' not in item.keys():
                         attn_modes.append("noise")
@@ -536,6 +696,16 @@ class SimpleCustomBatch:
             self.vit_token_seqlens = data["vit_token_seqlens"]
             if "lvr_target_vit_indexes" in data.keys():
                 self.lvr_target_vit_indexes = data["lvr_target_vit_indexes"]
+            
+            # LVR mode switch training data
+            if "lvr_start_positions" in data.keys():
+                self.lvr_start_positions = data["lvr_start_positions"]
+            if "lvr_token_positions" in data.keys():
+                self.lvr_token_positions = data["lvr_token_positions"]
+            if "lvr_end_positions" in data.keys():
+                self.lvr_end_positions = data["lvr_end_positions"]
+            if "lvr_latent_end_positions" in data.keys():
+                self.lvr_latent_end_positions = data["lvr_latent_end_positions"]
 
         if "packed_timesteps" in data.keys():
             self.packed_timesteps = data["packed_timesteps"]
@@ -570,6 +740,16 @@ class SimpleCustomBatch:
             self.vit_token_seqlens = self.vit_token_seqlens.pin_memory()
             if hasattr(self, 'lvr_target_vit_indexes'):
                 self.lvr_target_vit_indexes = self.lvr_target_vit_indexes.pin_memory()
+            
+            # LVR mode switch training data
+            if hasattr(self, 'lvr_start_positions'):
+                self.lvr_start_positions = self.lvr_start_positions.pin_memory()
+            if hasattr(self, 'lvr_token_positions'):
+                self.lvr_token_positions = self.lvr_token_positions.pin_memory()
+            if hasattr(self, 'lvr_end_positions'):
+                self.lvr_end_positions = self.lvr_end_positions.pin_memory()
+            if hasattr(self, 'lvr_latent_end_positions'):
+                self.lvr_latent_end_positions = self.lvr_latent_end_positions.pin_memory()
 
         if hasattr(self, 'packed_label_ids'):
             self.packed_label_ids = self.packed_label_ids.pin_memory()
@@ -602,6 +782,16 @@ class SimpleCustomBatch:
             self.vit_token_seqlens = self.vit_token_seqlens.to(device)
             if hasattr(self, 'lvr_target_vit_indexes'):
                 self.lvr_target_vit_indexes = self.lvr_target_vit_indexes.to(device)
+            
+            # LVR mode switch training data
+            if hasattr(self, 'lvr_start_positions'):
+                self.lvr_start_positions = self.lvr_start_positions.to(device)
+            if hasattr(self, 'lvr_token_positions'):
+                self.lvr_token_positions = self.lvr_token_positions.to(device)
+            if hasattr(self, 'lvr_end_positions'):
+                self.lvr_end_positions = self.lvr_end_positions.to(device)
+            if hasattr(self, 'lvr_latent_end_positions'):
+                self.lvr_latent_end_positions = self.lvr_latent_end_positions.to(device)
 
         if hasattr(self, 'packed_label_ids'):
             self.packed_label_ids = self.packed_label_ids.to(device)
@@ -639,6 +829,16 @@ class SimpleCustomBatch:
             data['vit_token_seqlens'] = self.vit_token_seqlens
             if hasattr(self, 'lvr_target_vit_indexes'):
                 data['lvr_target_vit_indexes'] = self.lvr_target_vit_indexes
+            
+            # LVR mode switch training data
+            if hasattr(self, 'lvr_start_positions'):
+                data['lvr_start_positions'] = self.lvr_start_positions
+            if hasattr(self, 'lvr_token_positions'):
+                data['lvr_token_positions'] = self.lvr_token_positions
+            if hasattr(self, 'lvr_end_positions'):
+                data['lvr_end_positions'] = self.lvr_end_positions
+            if hasattr(self, 'lvr_latent_end_positions'):
+                data['lvr_latent_end_positions'] = self.lvr_latent_end_positions
 
         if hasattr(self, 'packed_timesteps'):
             data['packed_timesteps'] = self.packed_timesteps

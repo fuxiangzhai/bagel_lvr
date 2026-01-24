@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Union
 
 import torch
 import torch.nn.functional as F
@@ -162,6 +162,7 @@ class Bagel(PreTrainedModel):
             nn.init.constant_(self.llm2vae.bias, 0)
 
     def _embedding_loss(self, pred: torch.Tensor, target: torch.Tensor, loss_fct: str) -> torch.Tensor:
+       
         if loss_fct == "mse":
             return F.mse_loss(pred, target)
         if loss_fct == "mae":
@@ -196,6 +197,11 @@ class Bagel(PreTrainedModel):
         mse_loss_indexes: Optional[torch.BoolTensor] = None,
         lvr_target_vit_indexes: Optional[torch.LongTensor] = None,
         anchor_target_embeddings: Optional[Dict[str, torch.Tensor]] = None,
+        # for LVR mode switch training
+        lvr_start_positions: Optional[torch.LongTensor] = None,
+        lvr_token_positions: Optional[torch.LongTensor] = None,
+        lvr_end_positions: Optional[torch.LongTensor] = None,
+        lvr_latent_end_positions: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -227,11 +233,37 @@ class Bagel(PreTrainedModel):
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
         if nested_attention_masks is None:
-            sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, packed_text_embedding.device)
             seqlen = sum(sample_lens)
+            split_lens_sum = sum(split_lens)
+            actual_packed_seq_len = len(packed_sequence)
+            
+            # 验证所有长度一致性
+            if seqlen != split_lens_sum:
+                raise ValueError(
+                    f"Length mismatch: sum(sample_lens)={seqlen} != sum(split_lens)={split_lens_sum}\n"
+                    f"sample_lens={sample_lens}\n"
+                    f"split_lens={split_lens}"
+                )
+            
+            if seqlen != actual_packed_seq_len:
+                raise ValueError(
+                    f"seqlen mismatch: sum(sample_lens)={seqlen} != len(packed_sequence)={actual_packed_seq_len}\n"
+                    f"sequence_length={sequence_length}"
+                )
+            
+            if sequence_length != seqlen:
+                raise ValueError(
+                    f"sequence_length mismatch: sequence_length={sequence_length} != sum(sample_lens)={seqlen}"
+                )
+            
+            # IMPORTANT: block_size must match BLOCK_SIZE used in create_block_mask
+            # FlexAttention rounds up sequence length to multiples of BLOCK_SIZE,
+            # and create_sparse_mask must pad tensors accordingly to avoid index out of bounds
+            BLOCK_SIZE = 128
+            sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, packed_text_embedding.device, block_size=BLOCK_SIZE)
             block_mask = create_block_mask(
                 sparse_mask, B=1, H=self.num_heads, Q_LEN=seqlen, KV_LEN=seqlen, 
-                device=packed_text_embedding.device, BLOCK_SIZE=128, _compile=True
+                device=packed_text_embedding.device, BLOCK_SIZE=BLOCK_SIZE, _compile=True
             )
             attention_mask = block_mask
         else:
@@ -252,6 +284,29 @@ class Bagel(PreTrainedModel):
             vit_token_pos_emb = self.vit_pos_embed(packed_vit_position_ids)
             packed_vit_token_embed = packed_vit_token_embed + vit_token_pos_emb
             packed_sequence[packed_vit_token_indexes] = packed_vit_token_embed
+            
+            # LVR Mode Switch Training: Replace <|lvr|> token positions with target ViT embeddings
+            # This is teacher forcing - model learns to expect ViT-like embeddings during LVR mode
+            if (
+                lvr_token_positions is not None 
+                and lvr_target_vit_indexes is not None 
+                and lvr_token_positions.numel() > 0
+            ):
+                lvr_count = min(lvr_token_positions.numel(), lvr_target_vit_indexes.numel())
+                lvr_target_embeddings = packed_vit_token_embed[lvr_target_vit_indexes[:lvr_count]]
+                packed_sequence[lvr_token_positions[:lvr_count]] = lvr_target_embeddings.to(packed_sequence.dtype)
+            
+            # Replace <|lvr_latent_end|> token embeddings with learnable lvr_latent_end_emb
+            # This is teacher forcing for the exit signal
+            if (
+                self.config.lvr_latent_end_token
+                and hasattr(self, 'lvr_latent_end_emb')
+                and lvr_latent_end_positions is not None
+                and lvr_latent_end_positions.numel() > 0
+            ):
+                packed_sequence[lvr_latent_end_positions] = self.lvr_latent_end_emb.unsqueeze(0).expand(
+                    lvr_latent_end_positions.numel(), -1
+                ).to(packed_sequence.dtype)
 
         if self.config.visual_gen:
             p = self.latent_patch_size
@@ -290,22 +345,116 @@ class Bagel(PreTrainedModel):
         )
 
         lvr = None
+        lvr_latent_end = None
         if (
             lvr_target_vit_indexes is not None
             and packed_vit_token_embed is not None
             and self.config.lvr_token_id is not None
         ):
-            lvr_mask = packed_text_ids == self.config.lvr_token_id
-            if lvr_mask.any():
-                lvr_token_indexes = packed_text_indexes[lvr_mask]
-                if lvr_token_indexes.numel() > 0:
-                    target = packed_vit_token_embed[lvr_target_vit_indexes]
-                    lvr_count = min(lvr_token_indexes.numel(), target.shape[0])
-                    pred_hidden = last_hidden_state[lvr_token_indexes[:lvr_count]]
+            # LVR Mode Switch Training Loss
+            # The model learns: <|lvr_start|> hidden state -> LVR head -> predict next position's embedding
+            # This teaches the model to generate embeddings that continue the latent reasoning
+            
+            if lvr_start_positions is not None and lvr_start_positions.numel() > 0:
+                # Support both single-step and multi-step LVR
+                # Predict from position before each <|lvr|> token (i.e., lvr_token_positions - 1)
+                # Single-step: <|lvr_start|> → <|lvr|>
+                # Multi-step: <|lvr_start|> → <|lvr|>₁ → <|lvr|>₂ → ... → <|lvr|>ₙ
+                target = packed_vit_token_embed[lvr_target_vit_indexes]
+                lvr_count = min(lvr_token_positions.numel(), target.shape[0])
+                
+                # Prediction positions: position before each <|lvr|> token
+                # This automatically handles both single-step and multi-step cases
+                pred_positions = lvr_token_positions[:lvr_count] - 1
+                
+                # CRITICAL FIX: Apply LVR head to last_hidden_state BEFORE computing loss
+                # This ensures training-inference consistency (aligned with Qwen implementation)
+                # The modified hidden states will participate in subsequent computations
+                if self.lvr_head is not None:
+                    last_hidden_state[pred_positions] = self.lvr_head(
+                        last_hidden_state[pred_positions]
+                    )
+                
+                # Now compute loss using the modified hidden states
+                pred_hidden = last_hidden_state[pred_positions]
+                target = target[:lvr_count].to(pred_hidden.dtype)
+                lvr = self._embedding_loss(pred_hidden, target, self.config.lvr_loss_fct)
+                
+                # LVR Latent End Training: Learn when to exit LVR mode
+                # The model learns to predict lvr_latent_end_emb when it should exit LVR mode
+                if (
+                    self.config.lvr_latent_end_token 
+                    and hasattr(self, 'lvr_latent_end_emb')
+                    and lvr_latent_end_positions is not None
+                    and lvr_latent_end_positions.numel() > 0
+                ):
+                    # At the position BEFORE <|lvr_latent_end|> token (i.e., the last <|lvr|> position),
+                    # the hidden state should predict lvr_latent_end_emb
+                    # This follows the autoregressive pattern: position i predicts position i+1
+                    lvr_pred_positions = lvr_latent_end_positions - 1
+                    
+                    # Sanity check: Warn if positions overlap (same position predicting different targets)
+                    if lvr_token_positions is not None and lvr_token_positions.numel() > 0:
+                        overlap = torch.isin(lvr_pred_positions, pred_positions)
+                        if overlap.any():
+                            import warnings
+                            warnings.warn(
+                                f"LVR: {overlap.sum()} positions overlap between lvr_token and lvr_latent_end predictions. "
+                                "Same position is being asked to predict both <|lvr|> and <|lvr_latent_end|> embeddings."
+                            )
+                    
+                    # Apply LVR head to these positions if not already applied
+                    # (they might overlap with pred_positions above, so we need to be careful)
                     if self.lvr_head is not None:
-                        pred_hidden = self.lvr_head(pred_hidden)
-                    target = target[:lvr_count].to(pred_hidden.dtype)
-                    lvr = self._embedding_loss(pred_hidden, target, self.config.lvr_loss_fct)
+                        # Check which positions haven't been modified yet
+                        positions_to_modify = lvr_pred_positions
+                        if lvr_token_positions is not None and lvr_token_positions.numel() > 0:
+                            # Get positions that were already modified
+                            already_modified = pred_positions
+                            # Only modify positions not in already_modified set
+                            mask = ~torch.isin(positions_to_modify, already_modified)
+                            new_positions = positions_to_modify[mask]
+                            if new_positions.numel() > 0:
+                                last_hidden_state[new_positions] = self.lvr_head(
+                                    last_hidden_state[new_positions]
+                                )
+                        else:
+                            # No previous modifications, apply to all
+                            last_hidden_state[positions_to_modify] = self.lvr_head(
+                                last_hidden_state[positions_to_modify]
+                            )
+                    
+                    # Now compute loss using the modified hidden states
+                    lvr_pred_for_end = last_hidden_state[lvr_pred_positions]
+                    
+                    # Target is the learnable lvr_latent_end_emb, expanded to match batch
+                    end_count = lvr_latent_end_positions.numel()
+                    latent_end_target = self.lvr_latent_end_emb.unsqueeze(0).expand(end_count, -1)
+                    latent_end_target = latent_end_target.to(lvr_pred_for_end.dtype)
+                    lvr_latent_end = self._embedding_loss(
+                        lvr_pred_for_end, latent_end_target, self.config.lvr_loss_fct
+                    )
+            else:
+                # Fallback to original logic if no lvr_start_positions
+                lvr_mask = packed_text_ids == self.config.lvr_token_id
+                if lvr_mask.any():
+                    lvr_token_indexes = packed_text_indexes[lvr_mask]
+                    if lvr_token_indexes.numel() > 0:
+                        target = packed_vit_token_embed[lvr_target_vit_indexes]
+                        lvr_count = min(lvr_token_indexes.numel(), target.shape[0])
+                        # Use position before <|lvr|> to predict <|lvr|> embedding (autoregressive)
+                        pred_positions = lvr_token_indexes[:lvr_count] - 1
+                        
+                        # Apply LVR head to last_hidden_state BEFORE computing loss (consistent with above)
+                        if self.lvr_head is not None:
+                            last_hidden_state[pred_positions] = self.lvr_head(
+                                last_hidden_state[pred_positions]
+                            )
+                        
+                        # Now compute loss using the modified hidden states
+                        pred_hidden = last_hidden_state[pred_positions]
+                        target = target[:lvr_count].to(pred_hidden.dtype)
+                        lvr = self._embedding_loss(pred_hidden, target, self.config.lvr_loss_fct)
 
         mse = None
         if self.config.visual_gen:
@@ -317,7 +466,19 @@ class Bagel(PreTrainedModel):
         ce = None
         if ce_loss_indexes is not None:
             packed_ce_preds = self.language_model.lm_head(last_hidden_state[ce_loss_indexes])
-            ce = F.cross_entropy(packed_ce_preds, packed_label_ids, reduction="none")
+            
+            # Stage1 LVR Training: Mask out <|lvr|> tokens from CE loss
+            # Following LVR implementation where <|lvr|> tokens only contribute to LVR loss
+            # Only <|lvr_start|>, <|lvr_end|>, and <|lvr_latent_end|> tokens use CE loss
+            if self.config.lvr_token_id is not None:
+                # Create mask for <|lvr|> token positions in the label
+                lvr_token_mask = packed_label_ids == self.config.lvr_token_id
+                # Replace <|lvr|> labels with IGNORE_INDEX (-100)
+                masked_label_ids = packed_label_ids.clone()
+                masked_label_ids = masked_label_ids.masked_fill(lvr_token_mask, -100)
+                ce = F.cross_entropy(packed_ce_preds, masked_label_ids, reduction="none")
+            else:
+                ce = F.cross_entropy(packed_ce_preds, packed_label_ids, reduction="none")
 
         anchor = None
         if anchor_target_embeddings:
@@ -348,7 +509,7 @@ class Bagel(PreTrainedModel):
             if anchor_losses:
                 anchor = sum(anchor_losses) / len(anchor_losses)
 
-        return dict(mse=mse, ce=ce, lvr=lvr, anchor=anchor)
+        return dict(mse=mse, ce=ce, lvr=lvr, lvr_latent_end=lvr_latent_end, anchor=anchor)
 
 
     def prepare_prompts(self, curr_kvlens, curr_rope, prompts, tokenizer, new_token_ids):
@@ -1064,24 +1225,176 @@ class Bagel(PreTrainedModel):
         last_position_hidden_state: Optional[torch.Tensor] = None,
         lvr_start_id: Optional[int] = None,
         lvr_end_id: Optional[int] = None,
+        # LVR mode switch parameters
+        lvr_max_steps: Union[int, List[int]] = 16,  # Can be int or List[int] for per-sample steps
+        lvr_latent_end_threshold: float = 0.02,
+        lvr_exit_criterion: str = "token",  # "token", "latent", "steps"
     ):
+        """
+        Generate text with LVR (Latent Visual Reasoning) mode support.
+        
+        LVR Mode Switch Logic:
+        - Enter LVR mode: when current token is <|lvr_start|>
+        - In LVR mode: use hidden state (via LVR head) instead of token embedding
+        - Exit LVR mode: based on lvr_exit_criterion
+          - "token": exit when generating <|lvr_end|>
+          - "latent": exit when hidden state is close to lvr_latent_end_emb
+          - "steps": exit after lvr_max_steps (supports per-sample different steps)
+        
+        Args:
+            lvr_max_steps: Maximum LVR steps. Can be:
+                - int: same max steps for all samples in batch
+                - List[int]: different max steps for each sample in batch (aligned with QwenWithLVR)
+        """
         step = 0
         generated_sequence = []
         curr_tokens = packed_start_tokens
+        batch_size = curr_tokens.shape[0]
+        device = curr_tokens.device
+        
         if lvr_start_id is None:
             lvr_start_id = self.config.lvr_start_id
         if lvr_end_id is None:
             lvr_end_id = self.config.lvr_end_id
         if lvr_mode_switch is None:
-            lvr_mode_switch = torch.zeros_like(curr_tokens, dtype=torch.bool)
+            lvr_mode_switch = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
+        # Convert lvr_max_steps to tensor for per-sample support (aligned with QwenWithLVR)
+        if isinstance(lvr_max_steps, int):
+            lvr_steps_orig = torch.full((batch_size,), lvr_max_steps, dtype=torch.long, device=device)
+        else:
+            # List[int] - different steps for each sample
+            lvr_steps_orig = torch.tensor(lvr_max_steps, dtype=torch.long, device=device)
+            if lvr_steps_orig.shape[0] != batch_size:
+                raise ValueError(f"lvr_max_steps list length ({lvr_steps_orig.shape[0]}) must match batch_size ({batch_size})")
+        
+        # Track remaining LVR steps quota (aligned with QwenWithLVR's _lvr_deocding_by_steps)
+        lvr_remaining_steps = lvr_steps_orig.clone()
+        
+        # Store the processed hidden state from previous step (AFTER applying LVR head)
+        # This is used for embedding replacement, aligning with QwenWithLVR's last_position_hidden_state
+        # In Qwen, LVR head is applied inside forward (Line 794), then saved (Line 797)
+        # CRITICAL FIX: Initialize with last_position_hidden_state if provided (for resuming generation)
+        lvr_processed_hidden_state = last_position_hidden_state
+        # Store the previous step's processed hidden state (for latent end detection)
+        # Initialize to None so first iteration won't trigger exit
+        previous_lvr_hidden_state = None
+        
         while step < max_length:
             generated_sequence.append(curr_tokens)
+            
+            # Save previous step's processed hidden state BEFORE any logic (for latent end detection)
+            # This ensures we use the PREVIOUS step's hidden state for exit detection
+            # Aligned with QwenWithLVR's approach where last_position_hidden_state from step t-1
+            # is used for exit detection at the beginning of step t
+            previous_lvr_hidden_state = lvr_processed_hidden_state
+            
+            # LVR Mode Entry Detection (BEFORE embedding lookup)
+            # This must happen before we decide whether to use token embedding or hidden state
+            # Aligned with QwenWithLVR: detect current input token, update state immediately
+            if lvr_start_id is not None:
+                # IMPORTANT: Save old mode switch FIRST before any state changes
+                # This is used for embedding replacement decision
+                old_mode_switch = lvr_mode_switch.clone()
+                
+                # Check if current input token is <|lvr_start|>
+                # This is analogous to Qwen's: last_tokens = input_ids[:,-1]
+                current_input_tokens = curr_tokens
+                lvr_start_switch = (current_input_tokens == lvr_start_id).to(device=device)
+                
+                # Compute candidate new mode (aligned with Qwen's new_mode_switch)
+                # This includes entry detection but not exit detection yet
+                new_mode_switch = lvr_mode_switch | lvr_start_switch
+                
+                # Detect entry vs continuation (aligned with Qwen)
+                just_entered = (~lvr_mode_switch) & new_mode_switch
+                
+                # Reset quota when entering LVR mode (aligned with Qwen)
+                lvr_remaining_steps = torch.where(just_entered, lvr_steps_orig, lvr_remaining_steps)
+                
+                # Decrement quota only if we were already inside before this step
+                # IMPORTANT: Use old_mode_switch (the state BEFORE this step) for decrement
+                # This matches Qwen's: lvr_remaining_steps = lvr_remaining_steps - lvr_mode_switch.long()
+                # where lvr_mode_switch is the old state
+                lvr_remaining_steps = lvr_remaining_steps - old_mode_switch.long()
+                
+                # ============================================================
+                # LVR Mode Exit Logic (BEFORE forward pass)
+                # Aligned with QwenWithLVR where exit detection happens BEFORE forward pass
+                # This uses the PREVIOUS step's hidden state to determine if we should exit
+                # ============================================================
+                '''
+                LVR reasoning mode switches (same as QwenWithLVR):
+                
+                - Entry: detected above (when current input is <|lvr_start|>)
+                - Exit conditions based on lvr_exit_criterion:
+                  - "token": exit when generating <|lvr_end|> token (N/A here - checked after forward)
+                  - "latent": exit when hidden state is close to lvr_latent_end_emb
+                  - "steps": exit when quota is used up (supports per-sample different steps)
+                
+                Note: For latent mode, we use the PREVIOUS step's hidden state for exit detection,
+                      which is consistent with QwenWithLVR's implementation (Line 782-789).
+                '''
+                # Determine exit condition based on criterion
+                lvr_end_switch = torch.zeros(batch_size, dtype=torch.bool, device=device)
+                
+                if lvr_exit_criterion == "latent":
+                    # Exit when hidden state is close to lvr_latent_end_emb
+                    # Use the PREVIOUS step's hidden state (saved at the beginning of this iteration)
+                    # This is consistent with QwenWithLVR's implementation
+                    if (
+                        self.config.lvr_latent_end_token 
+                        and hasattr(self, 'lvr_latent_end_emb') 
+                        and previous_lvr_hidden_state is not None
+                    ):
+                        # Use the processed hidden state from PREVIOUS step
+                        pred_for_end = previous_lvr_hidden_state
+                        
+                        # Compute distance to lvr_latent_end_emb
+                        latent_end_target = self.lvr_latent_end_emb.unsqueeze(0).expand(batch_size, -1)
+                        distance = F.mse_loss(
+                            pred_for_end, 
+                            latent_end_target.to(pred_for_end.dtype),
+                            reduction='none'
+                        ).mean(dim=-1)
+                        lvr_end_switch = distance < lvr_latent_end_threshold
+                    # Combine with budget check (aligned with Qwen)
+                    lvr_budget_exceeded = lvr_remaining_steps <= 0
+                    lvr_mode_switch = (new_mode_switch & (~lvr_end_switch) & (~lvr_budget_exceeded)).to(torch.bool)
+                    
+                elif lvr_exit_criterion == "steps":
+                    # Exit when quota is used up (aligned with QwenWithLVR's _lvr_deocding_by_steps)
+                    # Final state: lvr_mode_switch = new_mode_switch & (lvr_remaining_steps > 0)
+                    lvr_mode_switch = (new_mode_switch & (lvr_remaining_steps > 0)).to(torch.bool)
+                    
+                elif lvr_exit_criterion == "token":
+                    # For token-based exit, we can't check before forward pass
+                    # (need to generate the token first), so just apply budget check here
+                    # The actual token check will happen after token generation
+                    lvr_budget_exceeded = lvr_remaining_steps <= 0
+                    lvr_mode_switch = (new_mode_switch & (~lvr_budget_exceeded)).to(torch.bool)
+                    
+                else:
+                    # Default: apply budget check
+                    lvr_budget_exceeded = lvr_remaining_steps <= 0
+                    lvr_mode_switch = (new_mode_switch & (~lvr_budget_exceeded)).to(torch.bool)
+            else:
+                old_mode_switch = lvr_mode_switch
+            
+            # Get token embedding
             packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
-            if last_position_hidden_state is not None and lvr_mode_switch is not None:
+            
+            # LVR Mode: Replace token embedding with processed hidden state from PREVIOUS step
+            # Note: We use old_mode_switch here because:
+            # - If we just entered (curr_tokens == <|lvr_start|>), we should NOT replace yet
+            # - We need to process <|lvr_start|> normally first to get its hidden state
+            # - The processed hidden state (after LVR head) will be used in the NEXT step
+            # This aligns with QwenWithLVR's Line 152-155 where last_position_hidden_state
+            # (which is saved after applying LVR head at Line 797) is used for embedding replacement
+            if lvr_processed_hidden_state is not None and old_mode_switch.any():
                 packed_text_embedding = packed_text_embedding.clone()
-                packed_text_embedding[lvr_mode_switch] = last_position_hidden_state[lvr_mode_switch].to(
-                    packed_text_embedding.dtype
-                )
+                packed_text_embedding[old_mode_switch] = lvr_processed_hidden_state[old_mode_switch].to(packed_text_embedding.dtype)
+            
             query_lens = torch.ones_like(curr_tokens)
             packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
                 0, len(key_values_lens), 
@@ -1113,18 +1426,49 @@ class Bagel(PreTrainedModel):
             past_key_values = output.past_key_values
             packed_query_sequence = output.packed_query_sequence
             pred_logits = self.language_model.lm_head(packed_query_sequence)
+            
+            # Store raw hidden state (before LVR head) for reference
             last_position_hidden_state = packed_query_sequence
-
+            
             if do_sample:
                 probs = nn.functional.softmax(pred_logits / temperature, dim=-1)
                 curr_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
             else:
                 curr_tokens = torch.argmax(pred_logits, dim=-1)
 
-            if lvr_mode_switch is not None and lvr_start_id is not None:
-                lvr_start_switch = curr_tokens == lvr_start_id
-                lvr_end_switch = curr_tokens == lvr_end_id if lvr_end_id is not None else torch.zeros_like(lvr_mode_switch)
-                lvr_mode_switch = (lvr_mode_switch | lvr_start_switch) & (~lvr_end_switch)
+            # Token-based Exit Post-processing (only for "token" criterion)
+            # For "latent" and "steps" criteria, exit detection already happened before forward pass
+            if lvr_start_id is not None and lvr_exit_criterion == "token" and lvr_end_id is not None:
+                # Exit when generating <|lvr_end|> token (check generated token)
+                # This must happen AFTER token generation, unlike latent-based exit
+                lvr_end_switch = curr_tokens == lvr_end_id
+                # Update mode switch to incorporate token-based exit
+                lvr_budget_exceeded = lvr_remaining_steps <= 0
+                lvr_mode_switch = (lvr_mode_switch & (~lvr_end_switch) & (~lvr_budget_exceeded)).to(torch.bool)
+            
+            # Save hidden state for next step's embedding
+            # SIMPLIFIED LOGIC (aligned with Qwen implementation):
+            # Apply LVR head to ALL samples in LVR mode, regardless of whether they just entered
+            # This ensures consistency: the hidden state used for next token's embedding
+            # always goes through the same processing (LVR head if in LVR mode)
+            # Reference: Qwen Line 793-794, 797
+            # 
+            # IMPORTANT: Directly modify packed_query_sequence (like training) for train-inference consistency
+            if lvr_start_id is not None:
+                if lvr_mode_switch.any():
+                    # For all samples in LVR mode, apply LVR head
+                    # Directly modify packed_query_sequence (same as training behavior)
+                    if self.lvr_head is not None:
+                        packed_query_sequence[lvr_mode_switch] = self.lvr_head(
+                            packed_query_sequence[lvr_mode_switch]
+                        )
+                    # No need to clone, just reference the modified tensor
+                    lvr_processed_hidden_state = packed_query_sequence
+                else:
+                    lvr_processed_hidden_state = packed_query_sequence
+            else:
+                # If LVR is not enabled, just save raw hidden state
+                lvr_processed_hidden_state = packed_query_sequence
 
             uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
             for i in range(len(uppacked)):
@@ -1136,8 +1480,11 @@ class Bagel(PreTrainedModel):
             packed_query_position_ids = packed_query_position_ids + 1
             step += 1
 
-            if end_token_id is not None and curr_tokens[0] == end_token_id: # only support batch=1
-                break
+            # Check for end token, but don't stop if still in LVR mode
+            # This ensures LVR reasoning completes before stopping
+            if end_token_id is not None and curr_tokens[0] == end_token_id:
+                if not lvr_mode_switch.any():
+                    break
 
         output_device = generated_sequence[0].device
         return torch.stack([i.to(output_device) for i in generated_sequence], dim=0)
